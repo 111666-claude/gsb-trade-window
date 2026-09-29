@@ -1,5 +1,4 @@
-// Package trade 是玩家交易窗口的状态机：双方改物品、确认、超时与成交。
-// 缺陷：不比对物品版本（对方换货后仍成交）、超时后仍能确认、确认状态没在改物品时清掉。
+// Package trade 是玩家交易窗口的状态机：双方改价、确认、超时与成交。
 package trade
 
 import "errors"
@@ -7,11 +6,20 @@ import "errors"
 // ErrInput 表示输入不合法。
 var ErrInput = errors.New("trade: 输入不合法")
 
+// ErrTimeout 表示操作发生在截止时间之后。
+var ErrTimeout = errors.New("trade: 已超过截止时间")
+
 // Offer 是一侧的报价。
 type Offer struct {
 	Item    string
 	Version int
 	Count   int
+}
+
+// confirmation 是一侧确认时双方报价版本的快照。
+type confirmation struct {
+	versionA int
+	versionB int
 }
 
 // Trade 是一次交易。
@@ -21,6 +29,11 @@ type Trade struct {
 	ConfirmedB bool
 	Deadline   int64
 	Settled    bool
+
+	versionA int
+	versionB int
+	confirmA confirmation
+	confirmB confirmation
 }
 
 // New 建一个交易窗口，deadline 之后过期。
@@ -28,40 +41,66 @@ func New(deadline int64) *Trade {
 	return &Trade{Deadline: deadline}
 }
 
-// Update 一侧修改报价。缺陷：不记录也不比对版本，也不清掉双方的确认状态。
+// Update 一侧修改报价：版本号递增，并清空双方的确认状态。
 func (t *Trade) Update(side string, offers []Offer) error {
 	for _, offer := range offers {
 		if offer.Count <= 0 {
 			return ErrInput
 		}
 	}
-	if side == "a" {
+	switch side {
+	case "a":
 		t.A = offers
-	} else if side == "b" {
+		t.versionA++
+	case "b":
 		t.B = offers
-	} else {
+		t.versionB++
+	default:
 		return ErrInput
 	}
+	t.ConfirmedA = false
+	t.ConfirmedB = false
 	return nil
 }
 
-// Confirm 一侧确认。缺陷：不检查是否超时，也不检查对方是否改过报价。
+// Confirm 一侧确认，记录确认时双方报价的版本；超时后确认失败。
 func (t *Trade) Confirm(side string, now int64) error {
+	if now > t.Deadline {
+		return ErrTimeout
+	}
+	snapshot := confirmation{versionA: t.versionA, versionB: t.versionB}
 	switch side {
 	case "a":
 		t.ConfirmedA = true
+		t.confirmA = snapshot
 	case "b":
 		t.ConfirmedB = true
+		t.confirmB = snapshot
 	default:
 		return ErrInput
 	}
 	return nil
 }
 
-// Settle 尝试成交。缺陷：只看两边 Confirmed，不看超时、不比对版本。
+// Settle 尝试成交：双方确认、未超时、报价版本与确认时一致才成交。
 func (t *Trade) Settle(now int64) bool {
-	if t.ConfirmedA && t.ConfirmedB {
-		t.Settled = true
+	if t.Settled {
+		return true
 	}
-	return t.Settled
+	if now > t.Deadline {
+		return false
+	}
+	if !t.ConfirmedA || !t.ConfirmedB {
+		return false
+	}
+	// 一侧有报价而另一侧为空时不进入成交判定。
+	if (len(t.A) == 0) != (len(t.B) == 0) {
+		return false
+	}
+	current := confirmation{versionA: t.versionA, versionB: t.versionB}
+	if t.confirmA != current || t.confirmB != current {
+		return false
+	}
+	t.Settled = true
+	return true
 }
